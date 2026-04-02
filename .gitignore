@@ -1,0 +1,18 @@
+# Output files
+*.xlsx
+*.csv
+VideoInfo.*
+
+# OS files
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# PowerShell
+*.ps1xml
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
