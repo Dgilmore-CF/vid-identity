@@ -195,3 +195,119 @@ Summary
 
 Done!
 ```
+
+---
+
+# Organize-Videos.ps1 - Video File Organizer
+
+A companion script for organizing, sorting, and cleaning up video libraries by resolution.
+
+## Features
+
+- **Sort by Resolution**: Automatically organize videos into folders (4K_UHD, 1080p_FHD, 720p_HD, etc.)
+- **Intelligent File Moves**: Checks disk space before moving files across drives
+- **Move Queuing**: When disk space is limited, queues files and retries as space becomes available
+- **Mass Deletion**: Delete all videos below a specified resolution threshold
+- **Dry-Run Mode**: Preview changes before executing with `Report` action
+
+## Actions
+
+| Action | Description |
+|--------|-------------|
+| `Sort` | Move videos into resolution-based subfolders |
+| `Delete` | Delete videos below minimum resolution |
+| `Report` | Dry-run - show what would happen without making changes |
+
+## Usage
+
+### Sort Videos into Resolution Folders
+
+```powershell
+# Windows - Sort videos into D:\Sorted\4K_UHD, D:\Sorted\1080p_FHD, etc.
+.\Organize-Videos.ps1 -Path "D:\Videos" -Action Sort -DestinationRoot "D:\Sorted" -Recurse
+
+# macOS/Linux
+pwsh ./Organize-Videos.ps1 -Path "/home/user/Videos" -Action Sort -DestinationRoot "/home/user/Sorted" -Recurse
+
+# Sort from multiple source directories
+.\Organize-Videos.ps1 -Path "D:\Videos", "E:\Downloads" -Action Sort -DestinationRoot "F:\Library" -Recurse
+```
+
+### Delete Low-Resolution Videos
+
+```powershell
+# Delete all videos below 720p (will prompt for confirmation)
+.\Organize-Videos.ps1 -Path "D:\Videos" -Action Delete -MinResolution 720p -Recurse
+
+# Delete all videos below 1080p without confirmation
+.\Organize-Videos.ps1 -Path "D:\Videos" -Action Delete -MinResolution 1080p -Recurse -Force
+
+# Available thresholds: 4K, 1440p, 1080p, 720p, 480p, 360p
+```
+
+### Preview Changes (Dry-Run)
+
+```powershell
+# See what would be deleted without actually deleting
+.\Organize-Videos.ps1 -Path "D:\Videos" -Action Report -MinResolution 1080p -Recurse
+
+# See how files would be sorted
+.\Organize-Videos.ps1 -Path "D:\Videos" -Action Report -DestinationRoot "D:\Sorted" -Recurse
+```
+
+## Disk Space Handling
+
+The script intelligently handles disk space:
+
+1. **Same-drive moves**: Instant (no space check needed)
+2. **Cross-drive moves**: Checks available space before each move
+3. **Queuing**: Files that can't be moved due to space are queued
+4. **Auto-retry**: After successful moves free up space, queued files are retried
+5. **Safety margin**: Maintains 5% free space buffer
+
+## Resolution Categories & Folder Names
+
+| Category | Min Height | Folder Name |
+|----------|------------|-------------|
+| 4K UHD | 2160p | `4K_UHD` |
+| 1440p QHD | 1440p | `1440p_QHD` |
+| 1080p FHD | 1080p | `1080p_FHD` |
+| 720p HD | 720p | `720p_HD` |
+| 480p SD | 480p | `480p_SD` |
+| 360p | 360p | `360p` |
+| Low | <360p | `Low_Resolution` |
+
+## Example Output
+
+```
+Video Organizer
+===============
+Action: Sort
+Using FFprobe: /usr/local/bin/ffprobe
+Destination drive free space: 245.67 GB
+
+Scanning for video files...
+Found 150 video file(s)
+Analyzing video files...
+Successfully analyzed 150 video(s)
+
+Resolution Summary:
+  4K UHD: 12 file(s), 89.5 GB
+  1080p FHD: 85 file(s), 120.3 GB
+  720p HD: 45 file(s), 35.2 GB
+  480p SD: 8 file(s), 2.1 GB
+
+Processing 4K UHD videos -> D:\Sorted\4K_UHD
+  Total size: 89.5 GB
+  Moved: movie1.mkv
+  Moved: movie2.mkv
+...
+
+--- Sort Results ---
+  Moved: 150
+  Queued: 0
+  Skipped: 0
+  Failed: 0
+
+Done!
+```
