@@ -611,6 +611,17 @@ function Resolve-OutputPath {
     return [System.IO.Path]::GetFullPath($Path)
 }
 
+function Add-TimestampToPath {
+    <# Insert a yyyyMMdd_HHmmss stamp before the extension (for alternate files). #>
+    param([string]$Path)
+    
+    $dir   = Split-Path $Path -Parent
+    $name  = [System.IO.Path]::GetFileNameWithoutExtension($Path)
+    $ext   = [System.IO.Path]::GetExtension($Path)
+    $stamp = Get-Date -Format "yyyyMMdd_HHmmss"
+    return Join-Path $dir ("{0}_{1}{2}" -f $name, $stamp, $ext)
+}
+
 function Export-ToExcel {
     param(
         [array]$Data,
@@ -635,28 +646,57 @@ function Export-ToExcel {
             Import-Module ImportExcel -ErrorAction SilentlyContinue
         }
     }
+    $haveExcel = [bool](Get-Command Export-Excel -ErrorAction SilentlyContinue)
     
-    if (Get-Command Export-Excel -ErrorAction SilentlyContinue) {
+    # Try Excel first (original path, then a timestamped alternate if it's locked).
+    if ($haveExcel) {
+        $excelTargets = @($OutputPath, (Add-TimestampToPath $OutputPath))
+        for ($i = 0; $i -lt $excelTargets.Count; $i++) {
+            $target = $excelTargets[$i]
+            try {
+                $Data | Export-Excel -Path $target -AutoSize -AutoFilter -FreezeTopRow -BoldTopRow -WorksheetName "Video Info" -ErrorAction Stop
+                Write-Host "Excel file saved to: $target" -ForegroundColor Green
+                return
+            }
+            catch {
+                if ($i -eq 0) {
+                    Write-Warning "Could not write '$OutputPath'. It may be open in Excel or locked. Trying an alternate filename..."
+                }
+                else {
+                    Write-Warning "Excel export failed: $($_.Exception.Message)"
+                }
+            }
+        }
+        Write-Host "Falling back to CSV..." -ForegroundColor Yellow
+    }
+    
+    # CSV fallback (module missing, or every Excel attempt failed).
+    $csvBase = [System.IO.Path]::ChangeExtension($OutputPath, ".csv")
+    $csvTargets = @($csvBase, (Add-TimestampToPath $csvBase))
+    for ($i = 0; $i -lt $csvTargets.Count; $i++) {
+        $target = $csvTargets[$i]
         try {
-            $Data | Export-Excel -Path $OutputPath -AutoSize -AutoFilter -FreezeTopRow -BoldTopRow -WorksheetName "Video Info"
-            Write-Host "Excel file saved to: $OutputPath" -ForegroundColor Green
+            $Data | Export-Csv -Path $target -NoTypeInformation -Encoding UTF8 -ErrorAction Stop
+            if (-not $haveExcel) {
+                Write-Host "ImportExcel module not found - saved CSV instead of XLSX." -ForegroundColor Yellow
+            }
+            Write-Host "CSV file saved to: $target" -ForegroundColor $(if ($haveExcel) { "Green" } else { "Yellow" })
+            if (-not $haveExcel) {
+                Write-Host "Tip: for .xlsx output run: Install-Module ImportExcel -Scope CurrentUser" -ForegroundColor DarkGray
+            }
+            return
         }
         catch {
-            Write-Warning "Failed to write Excel file '$OutputPath': $_"
+            if ($i -eq 0) {
+                Write-Warning "Could not write '$csvBase' (is it open?). Trying an alternate filename..."
+            }
+            else {
+                Write-Warning "Failed to write CSV file '$target': $($_.Exception.Message)"
+            }
         }
     }
-    else {
-        $csvPath = [System.IO.Path]::ChangeExtension($OutputPath, ".csv")
-        try {
-            $Data | Export-Csv -Path $csvPath -NoTypeInformation -Encoding UTF8
-            Write-Host "ImportExcel module not found - saved CSV instead of XLSX." -ForegroundColor Yellow
-            Write-Host "CSV file saved to: $csvPath" -ForegroundColor Yellow
-            Write-Host "Tip: for .xlsx output run: Install-Module ImportExcel -Scope CurrentUser" -ForegroundColor DarkGray
-        }
-        catch {
-            Write-Warning "Failed to write CSV file '$csvPath': $_"
-        }
-    }
+    
+    Write-Warning "Unable to save the report to any location. Close the file if it is open in Excel and run again."
 }
 
 function Write-DeletionLog {
