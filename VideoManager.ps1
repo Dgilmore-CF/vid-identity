@@ -30,7 +30,17 @@
     Path for Excel/CSV output (Analyze action). Defaults to VideoInfo.xlsx.
 
 .PARAMETER DestinationRoot
-    Root folder for resolution subfolders (Sort action).
+    Root folder for resolution subfolders (Sort action). Used as the fallback
+    destination for any quality not explicitly mapped via -QualityMap.
+
+.PARAMETER QualityMap
+    Hashtable mapping resolution qualities to destination roots so different
+    qualities can be sorted onto different drives in a single session. Keys may
+    be the short names (4K, 1440p, 1080p, 720p, 480p, 360p, Low) or the full
+    category names (e.g. "4K UHD"). Example:
+        -QualityMap @{ "4K" = "D:\4K"; "1080p" = "E:\HD"; "720p" = "E:\HD" }
+    When a target drive runs low on space, files intelligently overflow to the
+    destination drive with the most available space (largest files placed first).
 
 .PARAMETER MinResolution
     Minimum resolution to keep (Delete/Report actions).
@@ -59,6 +69,12 @@
 .EXAMPLE
     # Sort videos into resolution folders
     .\VideoManager.ps1 -Path "D:\Videos" -Action Sort -DestinationRoot "D:\Sorted" -Recurse
+
+.EXAMPLE
+    # Sort different qualities to different drives, overflowing intelligently
+    .\VideoManager.ps1 -Path "D:\Videos" -Action Sort -Recurse `
+        -QualityMap @{ "4K" = "X:\4K"; "1080p" = "Y:\HD"; "720p" = "Y:\HD" } `
+        -DestinationRoot "Z:\Other"
 
 .EXAMPLE
     # Delete all videos below 720p (logs removed files for re-acquisition)
@@ -92,6 +108,8 @@ param(
     [string]$OutputFile,
     
     [string]$DestinationRoot,
+    
+    [hashtable]$QualityMap,
     
     [ValidateSet("4K", "1440p", "1080p", "720p", "480p", "360p")]
     [string]$MinResolution,
@@ -147,6 +165,27 @@ $ResolutionSortOrder = @{
     "480p SD"   = 2
     "360p"      = 1
     "Low"       = 0
+}
+
+# Map between short quality names (used in -QualityMap) and full category names.
+$ShortToCategory = @{
+    "4K"    = "4K UHD"
+    "1440p" = "1440p QHD"
+    "1080p" = "1080p FHD"
+    "720p"  = "720p HD"
+    "480p"  = "480p SD"
+    "360p"  = "360p"
+    "Low"   = "Low"
+}
+
+$CategoryToShort = @{
+    "4K UHD"    = "4K"
+    "1440p QHD" = "1440p"
+    "1080p FHD" = "1080p"
+    "720p HD"   = "720p"
+    "480p SD"   = "480p"
+    "360p"      = "360p"
+    "Low"       = "Low"
 }
 
 #endregion
@@ -695,28 +734,230 @@ function Invoke-AnalyzeAction {
     }
 }
 
-function Invoke-SortAction {
-    [CmdletBinding(SupportsShouldProcess = $true)]
-    param([array]$Videos, [string]$DestRoot, [switch]$WhatIf)
+function Resolve-CategoryRootMap {
+    <#
+        Build a map of full resolution category -> destination root for the
+        categories actually present. -QualityMap keys may be short names
+        (4K, 1080p, ...) or full categories ("4K UHD"). Unmapped categories fall
+        back to $DefaultRoot. Returns the map plus any categories left unmapped.
+    #>
+    param(
+        [hashtable]$QualityMap,
+        [string]$DefaultRoot,
+        [string[]]$Categories
+    )
     
-    $results = @{ Moved = 0; Queued = 0; Skipped = 0; Failed = 0 }
-    $moveQueue = [System.Collections.Generic.List[PSCustomObject]]::new()
+    $map = @{}
+    $unmapped = [System.Collections.Generic.List[string]]::new()
     
-    $destDrive = Get-VolumeId -Path $DestRoot
-    $groupedVideos = $Videos | Group-Object ResolutionCategory
-    
-    foreach ($group in $groupedVideos) {
-        $folderName = $ResolutionFolderNames[$group.Name]
-        if (-not $folderName) {
-            Write-Warning "Unknown resolution category '$($group.Name)'; using 'Low_Resolution'."
-            $folderName = "Low_Resolution"
+    foreach ($cat in $Categories) {
+        $short = $CategoryToShort[$cat]
+        $root = $null
+        
+        if ($QualityMap) {
+            if ($short -and $QualityMap.ContainsKey($short)) {
+                $root = $QualityMap[$short]
+            }
+            elseif ($QualityMap.ContainsKey($cat)) {
+                $root = $QualityMap[$cat]
+            }
         }
-        $destFolder = Join-Path $DestRoot $folderName
         
-        $totalSizeGB = [math]::Round(($group.Group | Measure-Object -Property FileSizeBytes -Sum).Sum / 1GB, 2)
-        Write-Host "`nProcessing $($group.Name) -> $destFolder ($totalSizeGB GB)" -ForegroundColor Cyan
+        if (-not $root) { $root = $DefaultRoot }
         
-        foreach ($video in $group.Group) {
+        if ($root) {
+            $map[$cat] = $root
+        }
+        else {
+            $unmapped.Add($cat)
+        }
+    }
+    
+    return [PSCustomObject]@{ Map = $map; Unmapped = @($unmapped) }
+}
+
+function Get-InteractiveQualityAssignment {
+    <#
+        Interactively assign each present resolution category to a drive/volume.
+        Returns a hashtable of full category -> destination root, or $null if
+        the user cancels.
+    #>
+    param([string[]]$Categories)
+    
+    $drives = @(Get-AvailableDrives)
+    if ($drives.Count -eq 0) {
+        Write-Warning "No drives detected for assignment."
+        return $null
+    }
+    
+    Write-Host "`nAssign each quality to a destination drive:" -ForegroundColor Cyan
+    for ($i = 0; $i -lt $drives.Count; $i++) {
+        $d = $drives[$i]
+        $freeStr = if ($null -ne $d.FreeGB) { "$($d.FreeGB) GB free" } else { "size unknown" }
+        Write-Host ("  [{0}] {1}  ({2})" -f ($i + 1), $d.Root, $freeStr) -ForegroundColor White
+    }
+    Write-Host "Tip: multiple qualities can share the same drive." -ForegroundColor DarkGray
+    
+    $map = @{}
+    $lastIndex = 1
+    
+    foreach ($cat in $Categories) {
+        while ($true) {
+            $choice = Read-Host "Drive number for [$cat] (default $lastIndex)"
+            if ([string]::IsNullOrWhiteSpace($choice)) { $choice = "$lastIndex" }
+            
+            $index = 0
+            if ([int]::TryParse($choice, [ref]$index) -and $index -ge 1 -and $index -le $drives.Count) {
+                $map[$cat] = $drives[$index - 1].Root
+                $lastIndex = $index
+                break
+            }
+            Write-Host "Invalid selection. Enter 1-$($drives.Count)." -ForegroundColor Yellow
+        }
+    }
+    
+    return $map
+}
+
+function New-SortPlan {
+    <#
+        Produce a placement plan for sorting videos onto (potentially) multiple
+        drives. Honours the preferred drive per quality, and intelligently
+        overflows to the destination drive with the most available space when a
+        preferred drive is full. Largest files are placed first (first-fit
+        decreasing) for better packing. Same-volume moves consume no extra space.
+    #>
+    param(
+        [array]$Videos,
+        [hashtable]$CategoryRootMap,
+        [double]$SafetyMarginPercent = 5
+    )
+    
+    $roots = @($CategoryRootMap.Values | Select-Object -Unique)
+    
+    # Gather per-volume capacity once; track projected free space as we plan.
+    $rootVol = @{}
+    $volInfo = @{}
+    foreach ($root in $roots) {
+        $vid = Get-VolumeId -Path $root
+        $rootVol[$root] = $vid
+        if (-not $volInfo.ContainsKey($vid)) {
+            $di = Get-DriveInfo -Path $root
+            if ($di) {
+                $free = [double]$di.FreeBytes
+                $total = [double]$di.TotalBytes
+                $reserve = $total * ($SafetyMarginPercent / 100)
+            }
+            else {
+                # Unknown capacity: assume effectively unlimited (matches prior behaviour).
+                $free = [double]::MaxValue
+                $total = 0
+                $reserve = 0
+            }
+            $volInfo[$vid] = [PSCustomObject]@{
+                VolumeId      = $vid
+                FreeBytes     = $free
+                TotalBytes    = $total
+                Reserve       = $reserve
+                ProjectedFree = $free
+                Roots         = [System.Collections.Generic.List[string]]::new()
+            }
+        }
+        $volInfo[$vid].Roots.Add($root)
+    }
+    
+    $assignments = [System.Collections.Generic.List[PSCustomObject]]::new()
+    $unplaceable = [System.Collections.Generic.List[PSCustomObject]]::new()
+    
+    # First-fit decreasing: place the largest files while space is plentiful.
+    $ordered = $Videos | Sort-Object FileSizeBytes -Descending
+    
+    foreach ($video in $ordered) {
+        $category = $video.ResolutionCategory
+        $preferredRoot = $CategoryRootMap[$category]
+        if (-not $preferredRoot) { $preferredRoot = $roots | Select-Object -First 1 }
+        
+        # Try preferred drive first, then the remaining drives by most free space.
+        $others = @($roots |
+            Where-Object { $_ -ne $preferredRoot } |
+            Sort-Object { $volInfo[$rootVol[$_]].ProjectedFree } -Descending)
+        $candidateRoots = @($preferredRoot) + $others
+        
+        $placed = $false
+        foreach ($cand in $candidateRoots) {
+            $vid = $rootVol[$cand]
+            $vi = $volInfo[$vid]
+            $isOverflow = ($cand -ne $preferredRoot)
+            $sameVolAsSource = ($video.Drive -eq $vid)
+            
+            if ($sameVolAsSource) {
+                # Move within the same volume: instant, no extra space used.
+                $assignments.Add([PSCustomObject]@{
+                    Video      = $video
+                    Root       = $cand
+                    VolumeId   = $vid
+                    IsOverflow = $isOverflow
+                    SameVolume = $true
+                })
+                $placed = $true
+                break
+            }
+            
+            if (($vi.ProjectedFree - $video.FileSizeBytes) -ge $vi.Reserve) {
+                $vi.ProjectedFree -= $video.FileSizeBytes
+                $assignments.Add([PSCustomObject]@{
+                    Video      = $video
+                    Root       = $cand
+                    VolumeId   = $vid
+                    IsOverflow = $isOverflow
+                    SameVolume = $false
+                })
+                $placed = $true
+                break
+            }
+        }
+        
+        if (-not $placed) { $unplaceable.Add($video) }
+    }
+    
+    return [PSCustomObject]@{
+        Assignments = $assignments
+        Unplaceable = $unplaceable
+        Volumes     = @($volInfo.Values)
+        RootVolume  = $rootVol
+    }
+}
+
+function Invoke-SortAction {
+    param([array]$Videos, [hashtable]$CategoryRootMap, [switch]$WhatIf)
+    
+    $results = @{ Moved = 0; Skipped = 0; Failed = 0; Overflowed = 0; Unplaceable = 0 }
+    
+    $plan = New-SortPlan -Videos $Videos -CategoryRootMap $CategoryRootMap
+    
+    # Pre-create distinct destination roots (real runs only).
+    if (-not $WhatIf) {
+        foreach ($root in @($CategoryRootMap.Values | Select-Object -Unique)) {
+            if (-not (Test-Path $root)) {
+                try { New-Item -Path $root -ItemType Directory -Force | Out-Null }
+                catch { Write-Warning "Could not create destination root '$root': $_" }
+            }
+        }
+    }
+    
+    # Group assignments by destination volume for readable, batched output.
+    $byVolume = $plan.Assignments | Group-Object VolumeId
+    
+    foreach ($volGroup in $byVolume) {
+        $sample = $volGroup.Group[0]
+        $volSizeGB = [math]::Round(($volGroup.Group | ForEach-Object { $_.Video.FileSizeBytes } | Measure-Object -Sum).Sum / 1GB, 2)
+        Write-Host "`nVolume $($volGroup.Name) <- $($volGroup.Count) file(s), $volSizeGB GB" -ForegroundColor Cyan
+        
+        foreach ($a in $volGroup.Group) {
+            $video = $a.Video
+            $folderName = $ResolutionFolderNames[$video.ResolutionCategory]
+            if (-not $folderName) { $folderName = "Low_Resolution" }
+            $destFolder = Join-Path $a.Root $folderName
             $destPath = Join-Path $destFolder $video.FileName
             
             if ($video.FullPath -eq $destPath) {
@@ -724,53 +965,41 @@ function Invoke-SortAction {
                 continue
             }
             
-            $sameDrive = $video.Drive -eq $destDrive
+            $moveResult = Move-VideoFile -VideoInfo $video -DestinationFolder $destFolder -WhatIf:$WhatIf
             
-            if ($sameDrive -or (Test-SufficientSpace -DestinationPath $DestRoot -RequiredBytes $video.FileSizeBytes)) {
-                $moveResult = Move-VideoFile -VideoInfo $video -DestinationFolder $destFolder -WhatIf:$WhatIf
-                
-                if ($moveResult.Success) {
-                    $results.Moved++
-                    if (-not $WhatIf) {
-                        Write-Host "  Moved: $($video.FileName)" -ForegroundColor Green
-                    }
-                } else {
-                    $results.Failed++
+            if ($moveResult.Success) {
+                $results.Moved++
+                if ($a.IsOverflow) { $results.Overflowed++ }
+                $tag = if ($a.IsOverflow) { " [overflow]" } else { "" }
+                if (-not $WhatIf) {
+                    Write-Host "  Moved$tag`: $($video.FileName) -> $folderName" -ForegroundColor $(if ($a.IsOverflow) { "Yellow" } else { "Green" })
                 }
-            } else {
-                $moveQueue.Add([PSCustomObject]@{ Video = $video; Destination = $destFolder })
-                $results.Queued++
-                Write-Host "  Queued (low space): $($video.FileName)" -ForegroundColor Yellow
+            }
+            else {
+                $results.Failed++
             }
         }
     }
     
-    # Retry queued items
-    if ($moveQueue.Count -gt 0 -and $results.Moved -gt 0) {
-        Write-Host "`nRetrying queued files..." -ForegroundColor Cyan
-        
-        foreach ($item in $moveQueue) {
-            if (Test-SufficientSpace -DestinationPath $DestRoot -RequiredBytes $item.Video.FileSizeBytes) {
-                $moveResult = Move-VideoFile -VideoInfo $item.Video -DestinationFolder $item.Destination -WhatIf:$WhatIf
-                
-                if ($moveResult.Success) {
-                    $results.Moved++
-                    $results.Queued--
-                    Write-Host "  Moved (from queue): $($item.Video.FileName)" -ForegroundColor Green
-                }
-            }
+    # Report anything that could not be placed on any destination drive.
+    if ($plan.Unplaceable.Count -gt 0) {
+        $results.Unplaceable = $plan.Unplaceable.Count
+        $unSizeGB = [math]::Round(($plan.Unplaceable | ForEach-Object { $_.FileSizeBytes } | Measure-Object -Sum).Sum / 1GB, 2)
+        Write-Host "`nUnplaceable (no drive has room): $($plan.Unplaceable.Count) file(s), $unSizeGB GB" -ForegroundColor Red
+        foreach ($v in $plan.Unplaceable | Select-Object -First 20) {
+            Write-Host "  - $($v.FileName) ($($v.FileSizeMB) MB, $($v.ResolutionCategory))" -ForegroundColor DarkYellow
         }
+        Write-Host "  Free up space or add another drive to -QualityMap." -ForegroundColor DarkGray
     }
     
     Write-Host "`n--- Sort Results ---" -ForegroundColor Cyan
-    Write-Host "  Moved: $($results.Moved)" -ForegroundColor Green
-    Write-Host "  Queued: $($results.Queued)" -ForegroundColor $(if ($results.Queued -gt 0) { "Yellow" } else { "Gray" })
-    Write-Host "  Skipped: $($results.Skipped)" -ForegroundColor Gray
+    Write-Host "  Moved: $($results.Moved) (of which overflow: $($results.Overflowed))" -ForegroundColor Green
+    Write-Host "  Skipped (already in place): $($results.Skipped)" -ForegroundColor Gray
+    Write-Host "  Unplaceable: $($results.Unplaceable)" -ForegroundColor $(if ($results.Unplaceable -gt 0) { "Red" } else { "Gray" })
     Write-Host "  Failed: $($results.Failed)" -ForegroundColor $(if ($results.Failed -gt 0) { "Red" } else { "Gray" })
 }
 
 function Invoke-DeleteAction {
-    [CmdletBinding(SupportsShouldProcess = $true)]
     param([array]$Videos, [string]$MinRes, [switch]$WhatIf, [switch]$ForceDelete, [string]$LogPath)
     
     $minHeight = $ResolutionThresholds[$MinRes]
@@ -834,13 +1063,15 @@ function Invoke-DeleteAction {
 }
 
 function Invoke-ReportAction {
-    param([array]$Videos, [string]$MinRes, [string]$DestRoot, [string]$LogPath)
+    param([array]$Videos, [string]$MinRes, [hashtable]$CategoryRootMap, [string]$LogPath)
     
     Write-Host "`n--- Report Mode (No Changes) ---" -ForegroundColor Yellow
     
-    if (-not $MinRes -and -not $DestRoot) {
+    $hasSort = $CategoryRootMap -and $CategoryRootMap.Count -gt 0
+    
+    if (-not $MinRes -and -not $hasSort) {
         Write-Host "`nNothing to preview. Provide -MinResolution (delete preview)" -ForegroundColor Yellow
-        Write-Host "and/or -DestinationRoot (sort preview)." -ForegroundColor Yellow
+        Write-Host "and/or -DestinationRoot / -QualityMap (sort preview)." -ForegroundColor Yellow
         return
     }
     
@@ -865,13 +1096,29 @@ function Invoke-ReportAction {
         }
     }
     
-    if ($DestRoot) {
-        Write-Host "`nSort preview:" -ForegroundColor Yellow
+    if ($hasSort) {
+        Write-Host "`nSort preview (quality -> drive):" -ForegroundColor Yellow
         $Videos | Group-Object ResolutionCategory | Sort-Object { $ResolutionSortOrder[$_.Name] } -Descending | ForEach-Object {
             $folderName = $ResolutionFolderNames[$_.Name]
             if (-not $folderName) { $folderName = "Low_Resolution" }
+            $root = $CategoryRootMap[$_.Name]
             $sizeGB = [math]::Round(($_.Group | Measure-Object -Property FileSizeBytes -Sum).Sum / 1GB, 2)
-            Write-Host "  $($_.Name) -> $DestRoot/$folderName ($($_.Count) files, $sizeGB GB)" -ForegroundColor Gray
+            Write-Host "  $($_.Name) -> $root/$folderName ($($_.Count) files, $sizeGB GB)" -ForegroundColor Gray
+        }
+        
+        # Show how the intelligent planner would actually distribute across drives.
+        $plan = New-SortPlan -Videos $Videos -CategoryRootMap $CategoryRootMap
+        
+        Write-Host "`nProjected distribution per drive (after overflow balancing):" -ForegroundColor Yellow
+        $plan.Assignments | Group-Object VolumeId | ForEach-Object {
+            $sizeGB = [math]::Round(($_.Group | ForEach-Object { $_.Video.FileSizeBytes } | Measure-Object -Sum).Sum / 1GB, 2)
+            $overflow = @($_.Group | Where-Object { $_.IsOverflow }).Count
+            Write-Host "  $($_.Name): $($_.Count) file(s), $sizeGB GB (overflow: $overflow)" -ForegroundColor Gray
+        }
+        
+        if ($plan.Unplaceable.Count -gt 0) {
+            $unSizeGB = [math]::Round(($plan.Unplaceable | ForEach-Object { $_.FileSizeBytes } | Measure-Object -Sum).Sum / 1GB, 2)
+            Write-Host "`n  Unplaceable (no drive has room): $($plan.Unplaceable.Count) file(s), $unSizeGB GB" -ForegroundColor Red
         }
     }
 }
@@ -884,7 +1131,10 @@ Write-Host "Video Manager" -ForegroundColor Cyan
 Write-Host "=============" -ForegroundColor Cyan
 Write-Host "Action: $Action" -ForegroundColor White
 
-# Interactive drive selection
+# Will the destination drives be chosen interactively (per quality, after scan)?
+$interactiveSort = ($SelectDrive -and $Action -eq "Sort" -and -not $DestinationRoot -and (-not $QualityMap -or $QualityMap.Count -eq 0))
+
+# Interactive scan-drive selection
 if ($SelectDrive) {
     $selectedScan = @(Select-Drive -Prompt "Select one or more drives/volumes to scan" -Multiple)
     if ($selectedScan.Count -gt 0) {
@@ -893,20 +1143,11 @@ if ($SelectDrive) {
     } else {
         Write-Host "No drive selected; using default path." -ForegroundColor Yellow
     }
-    
-    # Destination must be a single volume for sorting.
-    if ($Action -eq "Sort" -and -not $DestinationRoot) {
-        $selectedDest = @(Select-Drive -Prompt "Select a destination drive/volume for sorted videos")
-        if ($selectedDest.Count -gt 0) {
-            $DestinationRoot = $selectedDest[0]
-            Write-Host "Destination drive: $DestinationRoot" -ForegroundColor Green
-        }
-    }
 }
 
 # Validate parameters
-if ($Action -eq "Sort" -and -not $DestinationRoot) {
-    Write-Error "DestinationRoot is required for Sort action. Use -DestinationRoot <path> (or -SelectDrive)."
+if ($Action -eq "Sort" -and -not $DestinationRoot -and (-not $QualityMap -or $QualityMap.Count -eq 0) -and -not $interactiveSort) {
+    Write-Error "Sort requires -DestinationRoot, -QualityMap, or -SelectDrive to choose destinations."
     exit 1
 }
 
@@ -915,24 +1156,11 @@ if ($Action -eq "Delete" -and -not $MinResolution) {
     exit 1
 }
 
-# Validate / prepare DestinationRoot for Sort
-if ($Action -eq "Sort" -and $DestinationRoot) {
-    if (-not (Test-Path $DestinationRoot)) {
-        if ($PSCmdlet.ShouldProcess($DestinationRoot, "Create destination root directory")) {
-            try {
-                New-Item -Path $DestinationRoot -ItemType Directory -Force | Out-Null
-                Write-Host "Created destination root: $DestinationRoot" -ForegroundColor Green
-            }
-            catch {
-                Write-Error "Could not create DestinationRoot '$DestinationRoot': $_"
-                exit 1
-            }
-        }
-    }
-    elseif (-not (Test-Path $DestinationRoot -PathType Container)) {
-        Write-Error "DestinationRoot '$DestinationRoot' exists but is not a directory."
-        exit 1
-    }
+# Light validation for an explicit DestinationRoot (per-root creation happens in the
+# sort engine; quality-mapped roots are created/validated there too).
+if ($Action -eq "Sort" -and $DestinationRoot -and (Test-Path $DestinationRoot) -and -not (Test-Path $DestinationRoot -PathType Container)) {
+    Write-Error "DestinationRoot '$DestinationRoot' exists but is not a directory."
+    exit 1
 }
 
 # Resolve default deletion log path
@@ -975,14 +1203,6 @@ foreach ($p in $Path) {
 if ($resolvedPaths.Count -eq 0) {
     Write-Error "No valid paths specified."
     exit 1
-}
-
-# Show disk info for sort
-if ($DestinationRoot) {
-    $destInfo = Get-DriveInfo -Path $DestinationRoot
-    if ($destInfo) {
-        Write-Host "Destination free space: $($destInfo.FreeGB) GB" -ForegroundColor White
-    }
 }
 
 # Find video files (extension filtering via HashSet works on PS 5.1 and 7+,
@@ -1051,14 +1271,54 @@ if ($Action -eq "Analyze" -and -not $OutputFile) {
     $OutputFile = Join-Path $resolvedPaths[0] "VideoInfo.xlsx"
 }
 
+# Build the quality -> destination drive map (Sort and Report only).
+$categoryRootMap = @{}
+if ($Action -in @("Sort", "Report")) {
+    $presentCategories = @($analyzedVideos |
+        Select-Object -ExpandProperty ResolutionCategory -Unique |
+        Sort-Object { $ResolutionSortOrder[$_] } -Descending)
+    
+    if ($interactiveSort) {
+        $categoryRootMap = Get-InteractiveQualityAssignment -Categories $presentCategories
+        if (-not $categoryRootMap -or $categoryRootMap.Count -eq 0) {
+            Write-Error "No destination drives were assigned."
+            exit 1
+        }
+    }
+    elseif (($QualityMap -and $QualityMap.Count -gt 0) -or $DestinationRoot) {
+        $resolved = Resolve-CategoryRootMap -QualityMap $QualityMap -DefaultRoot $DestinationRoot -Categories $presentCategories
+        $categoryRootMap = $resolved.Map
+        
+        if ($resolved.Unmapped.Count -gt 0) {
+            if ($Action -eq "Sort") {
+                Write-Error "No destination for quality: $($resolved.Unmapped -join ', '). Add it to -QualityMap or set -DestinationRoot as a fallback."
+                exit 1
+            }
+            else {
+                Write-Warning "No destination mapped for: $($resolved.Unmapped -join ', '); excluded from sort preview."
+            }
+        }
+    }
+    
+    # Show free space for each distinct destination drive.
+    if ($categoryRootMap.Count -gt 0) {
+        Write-Host "`nDestination drive(s):" -ForegroundColor White
+        foreach ($root in @($categoryRootMap.Values | Select-Object -Unique)) {
+            $di = Get-DriveInfo -Path $root
+            $freeStr = if ($di) { "$($di.FreeGB) GB free" } else { "free space unknown" }
+            Write-Host "  $root ($freeStr)" -ForegroundColor Gray
+        }
+    }
+}
+
 # Execute action
 $isWhatIf = ($Action -eq "Report") -or $WhatIfPreference
 
 switch ($Action) {
     "Analyze" { Invoke-AnalyzeAction -Videos $analyzedVideos -OutputPath $OutputFile }
-    "Sort"    { Invoke-SortAction -Videos $analyzedVideos -DestRoot $DestinationRoot -WhatIf:$isWhatIf }
+    "Sort"    { Invoke-SortAction -Videos $analyzedVideos -CategoryRootMap $categoryRootMap -WhatIf:$isWhatIf }
     "Delete"  { Invoke-DeleteAction -Videos $analyzedVideos -MinRes $MinResolution -WhatIf:$isWhatIf -ForceDelete:$Force -LogPath $DeleteLog }
-    "Report"  { Invoke-ReportAction -Videos $analyzedVideos -MinRes $MinResolution -DestRoot $DestinationRoot -LogPath $DeleteLog }
+    "Report"  { Invoke-ReportAction -Videos $analyzedVideos -MinRes $MinResolution -CategoryRootMap $categoryRootMap -LogPath $DeleteLog }
 }
 
 Write-Host "`nDone!" -ForegroundColor Green

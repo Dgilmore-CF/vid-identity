@@ -112,12 +112,33 @@ pwsh ./VideoManager.ps1 -Path "/home/user/Videos" -Recurse
 Organize into folders: `4K_UHD`, `1080p_FHD`, `720p_HD`, etc.
 
 ```powershell
-# Sort videos into resolution folders
+# Sort videos into resolution folders on a single drive
 .\VideoManager.ps1 -Path "D:\Videos" -Action Sort -DestinationRoot "D:\Sorted" -Recurse
 
 # macOS/Linux
 pwsh ./VideoManager.ps1 -Path "/home/user/Videos" -Action Sort -DestinationRoot "/home/user/Sorted" -Recurse
 ```
+
+### Sort Different Qualities to Different Drives
+
+Use `-QualityMap` to send each quality to its own drive in a single session.
+Keys can be short names (`4K`, `1440p`, `1080p`, `720p`, `480p`, `360p`, `Low`)
+or full category names (`"4K UHD"`). Anything not listed falls back to
+`-DestinationRoot` (if provided).
+
+```powershell
+# 4K to a big archive drive, HD to a fast drive, everything else to a catch-all
+.\VideoManager.ps1 -Path "D:\Videos" -Action Sort -Recurse `
+    -QualityMap @{ "4K" = "X:\4K"; "1080p" = "Y:\HD"; "720p" = "Y:\HD" } `
+    -DestinationRoot "Z:\Other"
+```
+
+**Intelligent multi-drive balancing:** when a target drive runs low on space, files
+automatically overflow to the destination drive with the most free space. Largest
+files are placed first (first-fit-decreasing) for efficient packing, a 5% free-space
+buffer is kept on every drive, and files already on a destination volume are moved
+without an unnecessary cross-drive copy. Use `-Action Report` first to preview the
+exact distribution per drive.
 
 ### Delete Low-Resolution Videos
 
@@ -198,7 +219,8 @@ Default location: `VideoManager_DeletedLog_<timestamp>.csv` in the current direc
 | `-Recurse` | Include subdirectories |
 | `-Action` | `Analyze` (default), `Sort`, `Delete`, or `Report` |
 | `-OutputFile` | Excel/CSV output path (Analyze) |
-| `-DestinationRoot` | Root folder for resolution subfolders (Sort) |
+| `-DestinationRoot` | Root folder for resolution subfolders (Sort); fallback for unmapped qualities |
+| `-QualityMap` | Hashtable mapping qualities to destination drives, e.g. `@{ "4K"="X:\4K"; "1080p"="Y:\HD" }` |
 | `-MinResolution` | Minimum resolution to keep: `4K`, `1440p`, `1080p`, `720p`, `480p`, `360p` |
 | `-Force` | Skip confirmation prompts for destructive operations |
 | `-FFprobePath` | Explicit path to the ffprobe executable |
@@ -276,6 +298,25 @@ Get-ChildItem "D:\Media" -Directory | .\VideoManager.ps1
 
 # Preview a sort without moving anything (standard dry-run)
 .\VideoManager.ps1 -Path "D:\Videos" -Action Sort -DestinationRoot "D:\Sorted" -WhatIf
+```
+
+### `-QualityMap` — send each quality to a different drive
+
+```powershell
+# Per-quality drive targets; unmapped qualities use -DestinationRoot as fallback
+.\VideoManager.ps1 -Path "D:\Videos" -Action Sort -Recurse `
+    -QualityMap @{ "4K" = "X:\4K"; "1440p" = "X:\4K"; "1080p" = "Y:\HD"; "720p" = "Y:\HD" } `
+    -DestinationRoot "Z:\Other"
+
+# Full category names also work as keys
+.\VideoManager.ps1 -Path "D:\Videos" -Action Sort -QualityMap @{ "4K UHD" = "X:\4K" } -DestinationRoot "Y:\Rest"
+
+# Preview the exact per-drive distribution (including overflow) before moving
+.\VideoManager.ps1 -Path "D:\Videos" -Action Report -Recurse `
+    -QualityMap @{ "4K" = "X:\4K"; "1080p" = "Y:\HD" } -DestinationRoot "Z:\Other"
+
+# Interactively assign each detected quality to a drive
+.\VideoManager.ps1 -SelectDrive -Action Sort -Recurse
 ```
 
 ### `-Action Delete` + `-MinResolution` — remove low-res videos
@@ -380,10 +421,13 @@ Get-Help .\VideoManager.ps1 -Examples
 
 ## Disk Space Handling
 
-- **Same-drive moves**: Instant, no space check needed
-- **Cross-drive moves**: Checks available space before each move
-- **Queuing**: Files queued when space is low, auto-retried as space frees up
-- **Safety margin**: Maintains 5% free space buffer
+- **Per-quality targeting**: With `-QualityMap`, each quality goes to its assigned drive
+- **Intelligent overflow**: When a target drive is full, files move to the destination drive with the most free space
+- **First-fit decreasing**: Largest files are placed first for efficient packing
+- **Same-volume moves**: Instant, no cross-drive copy and no extra space consumed
+- **Safety margin**: Maintains a 5% free-space buffer on every destination drive
+- **Unplaceable reporting**: Files that fit nowhere are listed so you can free space or add a drive
+- **Preview**: `-Action Report` shows the projected distribution per drive before any move
 
 ---
 
