@@ -27,7 +27,9 @@
     - Report: Dry-run preview of Sort or Delete actions
 
 .PARAMETER OutputFile
-    Path for Excel/CSV output (Analyze action). Defaults to VideoInfo.xlsx.
+    Path for the Excel/CSV analysis spreadsheet. For the Analyze action it
+    defaults to VideoInfo.xlsx in the first scanned folder. For the Report
+    action the spreadsheet is written only when -OutputFile is supplied.
 
 .PARAMETER DestinationRoot
     Root folder for resolution subfolders (Sort action). Used as the fallback
@@ -1114,15 +1116,23 @@ function Invoke-DeleteAction {
 }
 
 function Invoke-ReportAction {
-    param([array]$Videos, [string]$MinRes, [hashtable]$CategoryRootMap, [string]$LogPath)
+    param([array]$Videos, [string]$MinRes, [hashtable]$CategoryRootMap, [string]$LogPath, [string]$OutputPath)
     
     Write-Host "`n--- Report Mode (No Changes) ---" -ForegroundColor Yellow
     
     $hasSort = $CategoryRootMap -and $CategoryRootMap.Count -gt 0
     
+    # Export the full analysis spreadsheet too, when an output file is requested.
+    if ($OutputPath) {
+        Write-Host "`nExporting analysis report of $($Videos.Count) video(s)..." -ForegroundColor White
+        Export-ToExcel -Data $Videos -OutputPath $OutputPath
+    }
+    
     if (-not $MinRes -and -not $hasSort) {
-        Write-Host "`nNothing to preview. Provide -MinResolution (delete preview)" -ForegroundColor Yellow
-        Write-Host "and/or -DestinationRoot / -QualityMap (sort preview)." -ForegroundColor Yellow
+        if (-not $OutputPath) {
+            Write-Host "`nNothing to preview. Provide -MinResolution (delete preview)," -ForegroundColor Yellow
+            Write-Host "-DestinationRoot / -QualityMap (sort preview), and/or -OutputFile (spreadsheet)." -ForegroundColor Yellow
+        }
         return
     }
     
@@ -1394,7 +1404,7 @@ switch ($Action) {
     "Analyze" { Invoke-AnalyzeAction -Videos $analyzedVideos -OutputPath $OutputFile }
     "Sort"    { Invoke-SortAction -Videos $analyzedVideos -CategoryRootMap $categoryRootMap -WhatIf:$isWhatIf }
     "Delete"  { Invoke-DeleteAction -Videos $analyzedVideos -MinRes $MinResolution -WhatIf:$isWhatIf -ForceDelete:$Force -LogPath $DeleteLog }
-    "Report"  { Invoke-ReportAction -Videos $analyzedVideos -MinRes $MinResolution -CategoryRootMap $categoryRootMap -LogPath $DeleteLog }
+    "Report"  { Invoke-ReportAction -Videos $analyzedVideos -MinRes $MinResolution -CategoryRootMap $categoryRootMap -LogPath $DeleteLog -OutputPath $OutputFile }
 }
 
 Write-Host "`nDone!" -ForegroundColor Green

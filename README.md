@@ -207,7 +207,7 @@ Default location: `VideoManager_DeletedLog_<timestamp>.csv` in the current direc
 | `Analyze` | Export video info to Excel/CSV (default) |
 | `Sort` | Move videos into resolution folders |
 | `Delete` | Delete videos below minimum resolution |
-| `Report` | Dry-run preview of Sort or Delete |
+| `Report` | Dry-run preview of Sort or Delete (also exports the analysis spreadsheet when `-OutputFile` is given) |
 
 ---
 
@@ -347,7 +347,14 @@ Get-ChildItem "D:\Media" -Directory | .\VideoManager.ps1
 
 # Preview both at once
 .\VideoManager.ps1 -Path "D:\Videos" -Action Report -MinResolution 720p -DestinationRoot "D:\Sorted" -Recurse
+
+# Preview AND save the full analysis spreadsheet (add -OutputFile)
+.\VideoManager.ps1 -Path "D:\Videos" -Action Report -MinResolution 1080p -Recurse -OutputFile "D:\Report.xlsx"
 ```
+
+> In `Report` mode the analysis spreadsheet is written only when you pass
+> `-OutputFile` (so a plain dry-run never creates files). The `Analyze` action
+> always writes the spreadsheet.
 
 ### `-WhatIf` (standard PowerShell dry-run)
 
