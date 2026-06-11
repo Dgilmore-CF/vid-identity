@@ -7,8 +7,10 @@
     - Analyzes video files and exports resolution/codec info to Excel
     - Sorts videos into resolution-based folders
     - Mass deletes videos below a resolution threshold
+    - Logs deleted files so higher-quality versions can be re-acquired
     - Intelligently handles disk space with move queuing
-    
+    - Offers interactive drive/volume selection
+
     Cross-platform compatible: Windows, macOS, and Linux.
 
 .PARAMETER Path
@@ -40,6 +42,14 @@
 .PARAMETER FFprobePath
     Optional path to ffprobe executable.
 
+.PARAMETER SelectDrive
+    Interactively select a drive/volume to scan (and, for Sort, a destination drive).
+
+.PARAMETER DeleteLog
+    Path to the CSV deletion log written before any files are deleted. This log
+    captures the metadata needed to re-acquire a higher-quality version of each
+    removed file. Defaults to VideoManager_DeletedLog_<timestamp>.csv.
+
 .EXAMPLE
     # Analyze videos and export to Excel
     .\VideoManager.ps1 -Path "D:\Videos" -Recurse
@@ -49,8 +59,12 @@
     .\VideoManager.ps1 -Path "D:\Videos" -Action Sort -DestinationRoot "D:\Sorted" -Recurse
 
 .EXAMPLE
-    # Delete all videos below 720p
+    # Delete all videos below 720p (logs removed files for re-acquisition)
     .\VideoManager.ps1 -Path "D:\Videos" -Action Delete -MinResolution 720p -Recurse
+
+.EXAMPLE
+    # Interactively pick a drive to scan
+    .\VideoManager.ps1 -SelectDrive -Recurse
 
 .EXAMPLE
     # Preview what would be deleted (dry-run)
@@ -82,7 +96,11 @@ param(
     
     [switch]$Force,
     
-    [string]$FFprobePath
+    [string]$FFprobePath,
+
+    [switch]$SelectDrive,
+
+    [string]$DeleteLog
 )
 
 #region Configuration
@@ -93,6 +111,11 @@ $VideoExtensions = @(
     "*.ts", "*.vob", "*.ogv", "*.divx", "*.xvid", "*.asf", "*.rm",
     "*.rmvb", "*.f4v", "*.hevc", "*.264", "*.265"
 )
+
+# Build a fast, case-insensitive lookup of bare extensions (".mp4", ".mkv", ...)
+$VideoExtensionSet = [System.Collections.Generic.HashSet[string]]::new(
+    [System.StringComparer]::OrdinalIgnoreCase)
+foreach ($ext in $VideoExtensions) { [void]$VideoExtensionSet.Add($ext.TrimStart('*')) }
 
 $ResolutionThresholds = @{
     "4K"    = 2160
@@ -113,6 +136,17 @@ $ResolutionFolderNames = @{
     "Low"       = "Low_Resolution"
 }
 
+# Numeric rank for resolution categories so summaries/sorts order correctly.
+$ResolutionSortOrder = @{
+    "4K UHD"    = 6
+    "1440p QHD" = 5
+    "1080p FHD" = 4
+    "720p HD"   = 3
+    "480p SD"   = 2
+    "360p"      = 1
+    "Low"       = 0
+}
+
 #endregion
 
 #region Platform Detection
@@ -123,6 +157,9 @@ if ($PSVersionTable.PSVersion.Major -ge 6) {
 } else {
     $IsWindowsOS = $true
 }
+
+# Cache volume identifiers per directory (avoids repeated df calls on Unix).
+$script:VolumeCache = @{}
 
 #endregion
 
@@ -223,17 +260,17 @@ function Get-VideoDetails {
             VideoCodec         = $videoStream.codec_name
             FileSizeBytes      = $fileInfo.Length
             FileSizeMB         = [math]::Round($fileInfo.Length / 1MB, 2)
-            Drive              = if ($IsWindowsOS) { [System.IO.Path]::GetPathRoot($FilePath) } else { "/" }
+            Drive              = Get-VolumeId -Path $FilePath
         }
         
-        # Extended info for Analyze action
+        # Extended info for Analyze / Delete / Report actions
         if ($Extended) {
             $durationSec = 0
             if ($info.format.duration) {
                 $durationSec = [double]($info.format.duration)
             }
             $duration = [TimeSpan]::FromSeconds($durationSec)
-            $durationStr = "{0:D2}:{1:D2}:{2:D2}" -f [int]$duration.TotalHours, $duration.Minutes, $duration.Seconds
+            $durationStr = '{0:00}:{1:00}:{2:00}' -f [int][math]::Floor($duration.TotalHours), $duration.Minutes, $duration.Seconds
             
             $bitrateMbps = 0
             if ($info.format.bit_rate) {
@@ -248,16 +285,21 @@ function Get-VideoDetails {
                 }
             }
             
+            # HDR: a true HDR transfer function is the reliable signal. bt2020 color
+            # space alone is not sufficient (can be SDR wide-gamut).
+            $isHdr = $videoStream.color_transfer -match "smpte2084|arib-std-b67"
+            
             $result | Add-Member -NotePropertyName "VideoCodecLong" -NotePropertyValue $videoStream.codec_long_name
             $result | Add-Member -NotePropertyName "AudioCodec" -NotePropertyValue $(if ($audioStream) { $audioStream.codec_name } else { "None" })
             $result | Add-Member -NotePropertyName "AudioCodecLong" -NotePropertyValue $(if ($audioStream) { $audioStream.codec_long_name } else { "None" })
+            $result | Add-Member -NotePropertyName "AudioChannels" -NotePropertyValue $(if ($audioStream) { $audioStream.channels } else { $null })
             $result | Add-Member -NotePropertyName "Duration" -NotePropertyValue $durationStr
             $result | Add-Member -NotePropertyName "DurationSeconds" -NotePropertyValue ([math]::Round($durationSec, 2))
             $result | Add-Member -NotePropertyName "FrameRate" -NotePropertyValue $frameRate
             $result | Add-Member -NotePropertyName "BitrateMbps" -NotePropertyValue $bitrateMbps
             $result | Add-Member -NotePropertyName "PixelFormat" -NotePropertyValue $videoStream.pix_fmt
             $result | Add-Member -NotePropertyName "ColorSpace" -NotePropertyValue $videoStream.color_space
-            $result | Add-Member -NotePropertyName "HDR" -NotePropertyValue $(if ($videoStream.color_transfer -match "smpte2084|arib-std-b67|bt2020") { "Yes" } else { "No" })
+            $result | Add-Member -NotePropertyName "HDR" -NotePropertyValue $(if ($isHdr) { "Yes" } else { "No" })
         }
         
         return $result
@@ -271,6 +313,44 @@ function Get-VideoDetails {
 #endregion
 
 #region Disk Space Functions
+
+function Get-VolumeId {
+    <#
+        Returns a stable identifier for the volume/filesystem that a path lives on.
+        Windows: the path root (e.g. "D:\").
+        Unix:    the backing filesystem device reported by df (distinguishes mounts).
+    #>
+    param([string]$Path)
+    
+    if ($IsWindowsOS) {
+        return [System.IO.Path]::GetPathRoot($Path)
+    }
+    
+    # Resolve to an existing directory for df (file may sit in a dir that exists).
+    $lookup = $Path
+    if (-not (Test-Path $lookup)) {
+        $lookup = Split-Path $Path -Parent
+        if (-not $lookup) { $lookup = "/" }
+    }
+    
+    if ($script:VolumeCache.ContainsKey($lookup)) {
+        return $script:VolumeCache[$lookup]
+    }
+    
+    $volId = "/"
+    try {
+        $dfOutput = & df -k -P $lookup 2>$null | Select-Object -Last 1
+        $parts = $dfOutput -split '\s+' | Where-Object { $_ }
+        if ($parts.Count -ge 1) {
+            # First column is the filesystem device; uniquely identifies the volume.
+            $volId = $parts[0]
+        }
+    }
+    catch { }
+    
+    $script:VolumeCache[$lookup] = $volId
+    return $volId
+}
 
 function Get-DriveInfo {
     param([string]$Path)
@@ -302,7 +382,7 @@ function Get-DriveInfo {
             }
         }
         else {
-            $dfOutput = & df -k $Path 2>&1 | Select-Object -Last 1
+            $dfOutput = & df -k -P $Path 2>&1 | Select-Object -Last 1
             $parts = $dfOutput -split '\s+' | Where-Object { $_ }
             
             if ($parts.Count -ge 4) {
@@ -324,6 +404,74 @@ function Get-DriveInfo {
     }
     
     return $null
+}
+
+function Get-AvailableDrives {
+    <# Enumerate mounted filesystem drives/volumes for interactive selection. #>
+    $drives = [System.Collections.Generic.List[PSCustomObject]]::new()
+    
+    if ($IsWindowsOS) {
+        Get-PSDrive -PSProvider FileSystem -ErrorAction SilentlyContinue | ForEach-Object {
+            $free = if ($_.Free) { [math]::Round($_.Free / 1GB, 2) } else { $null }
+            $total = if ($_.Free -and $_.Used) { [math]::Round(($_.Free + $_.Used) / 1GB, 2) } else { $null }
+            $drives.Add([PSCustomObject]@{
+                Name   = $_.Name
+                Root   = $_.Root
+                FreeGB = $free
+                TotalGB = $total
+            })
+        }
+    }
+    else {
+        $lines = & df -k -P 2>$null | Select-Object -Skip 1
+        foreach ($line in $lines) {
+            $parts = $line -split '\s+' | Where-Object { $_ }
+            if ($parts.Count -ge 6) {
+                $availKB = [long]$parts[3]
+                $totalKB = [long]$parts[1]
+                # Mount point is everything after the 5th column (may contain spaces).
+                $mount = ($parts[5..($parts.Count - 1)] -join ' ')
+                # Skip pseudo-filesystems that aren't useful targets.
+                if ($parts[0] -match '^(devfs|tmpfs|map|none|overlay)$') { continue }
+                $drives.Add([PSCustomObject]@{
+                    Name    = $parts[0]
+                    Root    = $mount
+                    FreeGB  = [math]::Round(($availKB * 1024) / 1GB, 2)
+                    TotalGB = [math]::Round(($totalKB * 1024) / 1GB, 2)
+                })
+            }
+        }
+    }
+    
+    return $drives
+}
+
+function Select-Drive {
+    param([string]$Prompt = "Select a drive")
+    
+    $drives = @(Get-AvailableDrives)
+    if ($drives.Count -eq 0) {
+        Write-Warning "No drives detected."
+        return $null
+    }
+    
+    Write-Host "`n$Prompt :" -ForegroundColor Cyan
+    for ($i = 0; $i -lt $drives.Count; $i++) {
+        $d = $drives[$i]
+        $freeStr = if ($null -ne $d.FreeGB) { "$($d.FreeGB) GB free" } else { "size unknown" }
+        Write-Host ("  [{0}] {1}  ({2})" -f ($i + 1), $d.Root, $freeStr) -ForegroundColor White
+    }
+    
+    while ($true) {
+        $choice = Read-Host "Enter number (1-$($drives.Count)) or blank to cancel"
+        if ([string]::IsNullOrWhiteSpace($choice)) { return $null }
+        
+        $index = 0
+        if ([int]::TryParse($choice, [ref]$index) -and $index -ge 1 -and $index -le $drives.Count) {
+            return $drives[$index - 1].Root
+        }
+        Write-Host "Invalid selection. Try again." -ForegroundColor Yellow
+    }
 }
 
 function Test-SufficientSpace {
@@ -355,9 +503,14 @@ function Export-ToExcel {
         [string]$OutputPath
     )
     
-    $useImportExcel = Get-Module -ListAvailable -Name ImportExcel
+    # Ensure the module is actually loaded (availability alone is not enough).
+    if (-not (Get-Command Export-Excel -ErrorAction SilentlyContinue)) {
+        if (Get-Module -ListAvailable -Name ImportExcel) {
+            Import-Module ImportExcel -ErrorAction SilentlyContinue
+        }
+    }
     
-    if ($useImportExcel) {
+    if (Get-Command Export-Excel -ErrorAction SilentlyContinue) {
         $Data | Export-Excel -Path $OutputPath -AutoSize -AutoFilter -FreezeTopRow -BoldTopRow -WorksheetName "Video Info"
         Write-Host "Excel file created: $OutputPath" -ForegroundColor Green
     }
@@ -369,15 +522,59 @@ function Export-ToExcel {
     }
 }
 
+function Write-DeletionLog {
+    <#
+        Records the metadata of files that are about to be (or would be) deleted so a
+        higher-quality replacement can be sourced later. Written BEFORE deletion.
+    #>
+    param(
+        [array]$Items,
+        [string]$LogPath,
+        [switch]$Preview
+    )
+    
+    if (-not $Items -or $Items.Count -eq 0) { return }
+    
+    $records = $Items | ForEach-Object {
+        [PSCustomObject]@{
+            FileName           = $_.FileName
+            SearchTitle        = [System.IO.Path]::GetFileNameWithoutExtension($_.FileName)
+            Resolution         = $_.Resolution
+            ResolutionCategory = $_.ResolutionCategory
+            Width              = $_.Width
+            Height             = $_.Height
+            VideoCodec         = $_.VideoCodec
+            Duration           = $_.Duration
+            DurationSeconds    = $_.DurationSeconds
+            FrameRate          = $_.FrameRate
+            BitrateMbps        = $_.BitrateMbps
+            FileSizeMB         = $_.FileSizeMB
+            OriginalDirectory  = $_.Directory
+            OriginalFullPath   = $_.FullPath
+            LoggedAt           = (Get-Date).ToString("s")
+        }
+    }
+    
+    try {
+        $records | Export-Csv -Path $LogPath -NoTypeInformation -Encoding UTF8
+        $label = if ($Preview) { "Re-acquisition preview log" } else { "Deletion log" }
+        Write-Host "$label written: $LogPath" -ForegroundColor Cyan
+        Write-Host "  Use this list to source higher-quality replacements." -ForegroundColor DarkGray
+    }
+    catch {
+        Write-Warning "Failed to write deletion log to $LogPath : $_"
+    }
+}
+
 #endregion
 
 #region File Operations
 
 function Move-VideoFile {
+    [CmdletBinding(SupportsShouldProcess = $true)]
     param(
         [PSCustomObject]$VideoInfo,
-        [string]$DestinationFolder,
-        [switch]$WhatIf
+        [string]$DestinationFolder
     )
     
     $destPath = Join-Path $DestinationFolder $VideoInfo.FileName
@@ -394,8 +591,7 @@ function Move-VideoFile {
         } while (Test-Path $destPath)
     }
     
-    if ($WhatIf) {
-        Write-Host "  [WhatIf] Would move: $($VideoInfo.FileName) -> $DestinationFolder" -ForegroundColor DarkYellow
+    if (-not $PSCmdlet.ShouldProcess("$($VideoInfo.FileName) -> $DestinationFolder", "Move")) {
         return [PSCustomObject]@{ Success = $true; WhatIf = $true }
     }
     
@@ -414,13 +610,12 @@ function Move-VideoFile {
 }
 
 function Remove-VideoFile {
+    [CmdletBinding(SupportsShouldProcess = $true)]
     param(
-        [PSCustomObject]$VideoInfo,
-        [switch]$WhatIf
+        [PSCustomObject]$VideoInfo
     )
     
-    if ($WhatIf) {
-        Write-Host "  [WhatIf] Would delete: $($VideoInfo.FileName) ($($VideoInfo.FileSizeMB) MB)" -ForegroundColor DarkYellow
+    if (-not $PSCmdlet.ShouldProcess("$($VideoInfo.FileName) ($($VideoInfo.FileSizeMB) MB)", "Delete")) {
         return [PSCustomObject]@{ Success = $true; SizeBytes = $VideoInfo.FileSizeBytes; WhatIf = $true }
     }
     
@@ -456,15 +651,21 @@ function Invoke-AnalyzeAction {
 }
 
 function Invoke-SortAction {
+    [CmdletBinding(SupportsShouldProcess = $true)]
     param([array]$Videos, [string]$DestRoot, [switch]$WhatIf)
     
     $results = @{ Moved = 0; Queued = 0; Skipped = 0; Failed = 0 }
     $moveQueue = [System.Collections.Generic.List[PSCustomObject]]::new()
     
+    $destDrive = Get-VolumeId -Path $DestRoot
     $groupedVideos = $Videos | Group-Object ResolutionCategory
     
     foreach ($group in $groupedVideos) {
         $folderName = $ResolutionFolderNames[$group.Name]
+        if (-not $folderName) {
+            Write-Warning "Unknown resolution category '$($group.Name)'; using 'Low_Resolution'."
+            $folderName = "Low_Resolution"
+        }
         $destFolder = Join-Path $DestRoot $folderName
         
         $totalSizeGB = [math]::Round(($group.Group | Measure-Object -Property FileSizeBytes -Sum).Sum / 1GB, 2)
@@ -478,9 +679,7 @@ function Invoke-SortAction {
                 continue
             }
             
-            $sourceDrive = $video.Drive
-            $destDrive = if ($IsWindowsOS) { [System.IO.Path]::GetPathRoot($DestRoot) } else { "/" }
-            $sameDrive = $sourceDrive -eq $destDrive
+            $sameDrive = $video.Drive -eq $destDrive
             
             if ($sameDrive -or (Test-SufficientSpace -DestinationPath $DestRoot -RequiredBytes $video.FileSizeBytes)) {
                 $moveResult = Move-VideoFile -VideoInfo $video -DestinationFolder $destFolder -WhatIf:$WhatIf
@@ -526,10 +725,11 @@ function Invoke-SortAction {
 }
 
 function Invoke-DeleteAction {
-    param([array]$Videos, [string]$MinRes, [switch]$WhatIf, [switch]$ForceDelete)
+    [CmdletBinding(SupportsShouldProcess = $true)]
+    param([array]$Videos, [string]$MinRes, [switch]$WhatIf, [switch]$ForceDelete, [string]$LogPath)
     
     $minHeight = $ResolutionThresholds[$MinRes]
-    $toDelete = $Videos | Where-Object { $_.Height -lt $minHeight }
+    $toDelete = @($Videos | Where-Object { $_.Height -lt $minHeight })
     
     if ($toDelete.Count -eq 0) {
         Write-Host "`nNo videos found below $MinRes resolution." -ForegroundColor Green
@@ -547,6 +747,10 @@ function Invoke-DeleteAction {
         $groupSize = [math]::Round(($_.Group | Measure-Object -Property FileSizeBytes -Sum).Sum / 1GB, 2)
         Write-Host "    $($_.Name): $($_.Count) file(s), $groupSize GB" -ForegroundColor Gray
     }
+    
+    # Always log what is about to be removed BEFORE deleting, so a higher-quality
+    # version can be re-acquired later.
+    Write-DeletionLog -Items $toDelete -LogPath $LogPath -Preview:$WhatIf
     
     if (-not $WhatIf -and -not $ForceDelete) {
         Write-Host "`nWARNING: This will permanently delete $($toDelete.Count) file(s) ($totalSizeGB GB)!" -ForegroundColor Red
@@ -585,13 +789,19 @@ function Invoke-DeleteAction {
 }
 
 function Invoke-ReportAction {
-    param([array]$Videos, [string]$MinRes, [string]$DestRoot)
+    param([array]$Videos, [string]$MinRes, [string]$DestRoot, [string]$LogPath)
     
     Write-Host "`n--- Report Mode (No Changes) ---" -ForegroundColor Yellow
     
+    if (-not $MinRes -and -not $DestRoot) {
+        Write-Host "`nNothing to preview. Provide -MinResolution (delete preview)" -ForegroundColor Yellow
+        Write-Host "and/or -DestinationRoot (sort preview)." -ForegroundColor Yellow
+        return
+    }
+    
     if ($MinRes) {
         $minHeight = $ResolutionThresholds[$MinRes]
-        $belowThreshold = $Videos | Where-Object { $_.Height -lt $minHeight }
+        $belowThreshold = @($Videos | Where-Object { $_.Height -lt $minHeight })
         $belowSize = [math]::Round(($belowThreshold | Measure-Object -Property FileSizeBytes -Sum).Sum / 1GB, 2)
         
         Write-Host "`nVideos below $MinRes (would be deleted):" -ForegroundColor Yellow
@@ -603,12 +813,18 @@ function Invoke-ReportAction {
                 Write-Host "    - $($v.FileName) ($($v.Resolution))" -ForegroundColor Gray
             }
         }
+        
+        # Write a re-acquisition preview log for the would-be-deleted set.
+        if ($belowThreshold.Count -gt 0) {
+            Write-DeletionLog -Items $belowThreshold -LogPath $LogPath -Preview
+        }
     }
     
     if ($DestRoot) {
         Write-Host "`nSort preview:" -ForegroundColor Yellow
-        $Videos | Group-Object ResolutionCategory | ForEach-Object {
+        $Videos | Group-Object ResolutionCategory | Sort-Object { $ResolutionSortOrder[$_.Name] } -Descending | ForEach-Object {
             $folderName = $ResolutionFolderNames[$_.Name]
+            if (-not $folderName) { $folderName = "Low_Resolution" }
             $sizeGB = [math]::Round(($_.Group | Measure-Object -Property FileSizeBytes -Sum).Sum / 1GB, 2)
             Write-Host "  $($_.Name) -> $DestRoot/$folderName ($($_.Count) files, $sizeGB GB)" -ForegroundColor Gray
         }
@@ -623,15 +839,60 @@ Write-Host "Video Manager" -ForegroundColor Cyan
 Write-Host "=============" -ForegroundColor Cyan
 Write-Host "Action: $Action" -ForegroundColor White
 
+# Interactive drive selection
+if ($SelectDrive) {
+    $selectedScan = Select-Drive -Prompt "Select a drive/volume to scan"
+    if ($selectedScan) {
+        $Path = @($selectedScan)
+        Write-Host "Scan drive: $selectedScan" -ForegroundColor Green
+    } else {
+        Write-Host "No drive selected; using default path." -ForegroundColor Yellow
+    }
+    
+    if ($Action -eq "Sort" -and -not $DestinationRoot) {
+        $selectedDest = Select-Drive -Prompt "Select a destination drive/volume for sorted videos"
+        if ($selectedDest) {
+            $DestinationRoot = $selectedDest
+            Write-Host "Destination drive: $selectedDest" -ForegroundColor Green
+        }
+    }
+}
+
 # Validate parameters
 if ($Action -eq "Sort" -and -not $DestinationRoot) {
-    Write-Error "DestinationRoot is required for Sort action. Use -DestinationRoot <path>"
+    Write-Error "DestinationRoot is required for Sort action. Use -DestinationRoot <path> (or -SelectDrive)."
     exit 1
 }
 
 if ($Action -eq "Delete" -and -not $MinResolution) {
     Write-Error "MinResolution is required for Delete action. Use -MinResolution <4K|1440p|1080p|720p|480p|360p>"
     exit 1
+}
+
+# Validate / prepare DestinationRoot for Sort
+if ($Action -eq "Sort" -and $DestinationRoot) {
+    if (-not (Test-Path $DestinationRoot)) {
+        if ($PSCmdlet.ShouldProcess($DestinationRoot, "Create destination root directory")) {
+            try {
+                New-Item -Path $DestinationRoot -ItemType Directory -Force | Out-Null
+                Write-Host "Created destination root: $DestinationRoot" -ForegroundColor Green
+            }
+            catch {
+                Write-Error "Could not create DestinationRoot '$DestinationRoot': $_"
+                exit 1
+            }
+        }
+    }
+    elseif (-not (Test-Path $DestinationRoot -PathType Container)) {
+        Write-Error "DestinationRoot '$DestinationRoot' exists but is not a directory."
+        exit 1
+    }
+}
+
+# Resolve default deletion log path
+if (-not $DeleteLog) {
+    $timestamp = Get-Date -Format "yyyyMMdd_HHmmss"
+    $DeleteLog = Join-Path (Get-Location).Path "VideoManager_DeletedLog_$timestamp.csv"
 }
 
 # Find FFprobe
@@ -678,14 +939,13 @@ if ($DestinationRoot) {
     }
 }
 
-# Find video files
+# Find video files (extension filtering via HashSet works on PS 5.1 and 7+,
+# recursive or not, unlike Get-ChildItem -Include on a bare directory path).
 Write-Host "`nScanning $($resolvedPaths.Count) path(s)..." -ForegroundColor White
 $videoFiles = @()
 foreach ($scanPath in $resolvedPaths) {
-    $searchParams = @{ Path = $scanPath; Include = $VideoExtensions; File = $true }
-    if ($Recurse) { $searchParams.Recurse = $true }
-    
-    $found = Get-ChildItem @searchParams -ErrorAction SilentlyContinue
+    $found = Get-ChildItem -Path $scanPath -File -Recurse:$Recurse -ErrorAction SilentlyContinue |
+        Where-Object { $VideoExtensionSet.Contains($_.Extension) }
     if ($found) { $videoFiles += $found }
 }
 
@@ -699,8 +959,11 @@ Write-Host "Found $($videoFiles.Count) video file(s)" -ForegroundColor Green
 # Analyze videos
 Write-Host "Analyzing..." -ForegroundColor White
 $analyzedVideos = @()
-$useExtended = $Action -eq "Analyze"
+# Extended metadata is needed for Analyze output and for the deletion/re-acquisition
+# log (duration, codec, bitrate help find a better replacement).
+$useExtended = $Action -in @("Analyze", "Delete", "Report")
 $processed = 0
+$failedCount = 0
 
 foreach ($file in $videoFiles) {
     $processed++
@@ -714,14 +977,25 @@ foreach ($file in $videoFiles) {
             Write-Host "[$processed/$($videoFiles.Count)] $($file.Name) - $($details.Resolution) - $($details.VideoCodec)" -ForegroundColor Gray
         }
     }
+    else {
+        $failedCount++
+    }
 }
 
 Write-Progress -Activity "Analyzing videos" -Completed
 Write-Host "Analyzed $($analyzedVideos.Count) video(s)" -ForegroundColor Green
+if ($failedCount -gt 0) {
+    Write-Host "Failed to analyze $failedCount file(s) (skipped; not a valid video or unreadable)." -ForegroundColor Yellow
+}
 
-# Show resolution summary
+if ($analyzedVideos.Count -eq 0) {
+    Write-Warning "No analyzable videos found."
+    exit 0
+}
+
+# Show resolution summary (ranked highest -> lowest)
 Write-Host "`nResolution Summary:" -ForegroundColor Cyan
-$analyzedVideos | Group-Object ResolutionCategory | Sort-Object { $ResolutionThresholds[$_.Name] } -Descending | ForEach-Object {
+$analyzedVideos | Group-Object ResolutionCategory | Sort-Object { $ResolutionSortOrder[$_.Name] } -Descending | ForEach-Object {
     $sizeGB = [math]::Round(($_.Group | Measure-Object -Property FileSizeBytes -Sum).Sum / 1GB, 2)
     Write-Host "  $($_.Name): $($_.Count) file(s), $sizeGB GB" -ForegroundColor White
 }
@@ -732,13 +1006,13 @@ if ($Action -eq "Analyze" -and -not $OutputFile) {
 }
 
 # Execute action
-$isWhatIf = $Action -eq "Report"
+$isWhatIf = ($Action -eq "Report") -or $WhatIfPreference
 
 switch ($Action) {
     "Analyze" { Invoke-AnalyzeAction -Videos $analyzedVideos -OutputPath $OutputFile }
     "Sort"    { Invoke-SortAction -Videos $analyzedVideos -DestRoot $DestinationRoot -WhatIf:$isWhatIf }
-    "Delete"  { Invoke-DeleteAction -Videos $analyzedVideos -MinRes $MinResolution -WhatIf:$isWhatIf -ForceDelete:$Force }
-    "Report"  { Invoke-ReportAction -Videos $analyzedVideos -MinRes $MinResolution -DestRoot $DestinationRoot }
+    "Delete"  { Invoke-DeleteAction -Videos $analyzedVideos -MinRes $MinResolution -WhatIf:$isWhatIf -ForceDelete:$Force -LogPath $DeleteLog }
+    "Report"  { Invoke-ReportAction -Videos $analyzedVideos -MinRes $MinResolution -DestRoot $DestinationRoot -LogPath $DeleteLog }
 }
 
 Write-Host "`nDone!" -ForegroundColor Green

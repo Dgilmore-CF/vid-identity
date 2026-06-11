@@ -11,6 +11,8 @@ A comprehensive PowerShell tool for analyzing, organizing, and managing video fi
 - **Delete** - Mass delete videos below a resolution threshold
 - **Report** - Dry-run preview of any action
 - **Disk Space Management** - Intelligent queuing when space is limited
+- **Drive Selection** - Interactively pick a drive/volume to scan or sort to
+- **Deletion Log** - Every removed file is logged first so you can re-acquire a higher-quality version
 
 ## Requirements
 
@@ -132,12 +134,46 @@ pwsh ./VideoManager.ps1 -Path "/home/user/Videos" -Action Sort -DestinationRoot 
 ### Preview Changes (Dry-Run)
 
 ```powershell
-# Preview what would be deleted
+# Preview what would be deleted (also writes a re-acquisition log)
 .\VideoManager.ps1 -Path "D:\Videos" -Action Report -MinResolution 1080p -Recurse
 
 # Preview how files would be sorted
 .\VideoManager.ps1 -Path "D:\Videos" -Action Report -DestinationRoot "D:\Sorted" -Recurse
 ```
+
+### Interactive Drive Selection
+
+Pick a drive/volume from a numbered list instead of typing a path:
+
+```powershell
+# Choose a drive to scan
+.\VideoManager.ps1 -SelectDrive -Recurse
+
+# Choose both a source drive and a destination drive for sorting
+.\VideoManager.ps1 -SelectDrive -Action Sort -Recurse
+```
+
+You can also use standard PowerShell `-WhatIf` with `Sort` and `Delete` to preview
+changes without modifying anything.
+
+---
+
+## Deletion Log (Re-Acquisition)
+
+Before **any** file is deleted (and during a `Delete`/`Report` dry-run), VideoManager
+writes a CSV log capturing the metadata needed to source a better copy later. The log
+is written *first*, so the record survives even if the deletion is interrupted.
+
+```powershell
+# Custom log path
+.\VideoManager.ps1 -Path "D:\Videos" -Action Delete -MinResolution 720p -DeleteLog "D:\reacquire.csv"
+```
+
+Default location: `VideoManager_DeletedLog_<timestamp>.csv` in the current directory.
+
+**Logged columns:** `FileName`, `SearchTitle`, `Resolution`, `ResolutionCategory`,
+`Width`, `Height`, `VideoCodec`, `Duration`, `DurationSeconds`, `FrameRate`,
+`BitrateMbps`, `FileSizeMB`, `OriginalDirectory`, `OriginalFullPath`, `LoggedAt`.
 
 ---
 
@@ -149,6 +185,24 @@ pwsh ./VideoManager.ps1 -Path "/home/user/Videos" -Action Sort -DestinationRoot 
 | `Sort` | Move videos into resolution folders |
 | `Delete` | Delete videos below minimum resolution |
 | `Report` | Dry-run preview of Sort or Delete |
+
+---
+
+## Parameters
+
+| Parameter | Description |
+|-----------|-------------|
+| `-Path` | One or more directories to scan (default: current directory) |
+| `-Recurse` | Include subdirectories |
+| `-Action` | `Analyze` (default), `Sort`, `Delete`, or `Report` |
+| `-OutputFile` | Excel/CSV output path (Analyze) |
+| `-DestinationRoot` | Root folder for resolution subfolders (Sort) |
+| `-MinResolution` | Minimum resolution to keep: `4K`, `1440p`, `1080p`, `720p`, `480p`, `360p` |
+| `-Force` | Skip confirmation prompts for destructive operations |
+| `-FFprobePath` | Explicit path to the ffprobe executable |
+| `-SelectDrive` | Interactively select a drive/volume to scan (and destination for Sort) |
+| `-DeleteLog` | Path to the deletion/re-acquisition CSV log |
+| `-WhatIf` | Standard PowerShell dry-run for Sort/Delete |
 
 ---
 

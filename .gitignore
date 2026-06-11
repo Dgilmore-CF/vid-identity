@@ -2,6 +2,7 @@
 *.xlsx
 *.csv
 VideoInfo.*
+VideoManager_DeletedLog_*.csv
 
 # OS files
 .DS_Store
