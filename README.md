@@ -143,13 +143,15 @@ pwsh ./VideoManager.ps1 -Path "/home/user/Videos" -Action Sort -DestinationRoot 
 
 ### Interactive Drive Selection
 
-Pick a drive/volume from a numbered list instead of typing a path:
+Pick one or more drives/volumes from a numbered list instead of typing paths.
+At the prompt, enter a single number, a comma/space-separated list (e.g. `1,3,4`),
+or `all` to select every drive:
 
 ```powershell
-# Choose a drive to scan
+# Choose one or more drives to scan
 .\VideoManager.ps1 -SelectDrive -Recurse
 
-# Choose both a source drive and a destination drive for sorting
+# Choose multiple source drives and a single destination drive for sorting
 .\VideoManager.ps1 -SelectDrive -Action Sort -Recurse
 ```
 
@@ -200,7 +202,7 @@ Default location: `VideoManager_DeletedLog_<timestamp>.csv` in the current direc
 | `-MinResolution` | Minimum resolution to keep: `4K`, `1440p`, `1080p`, `720p`, `480p`, `360p` |
 | `-Force` | Skip confirmation prompts for destructive operations |
 | `-FFprobePath` | Explicit path to the ffprobe executable |
-| `-SelectDrive` | Interactively select a drive/volume to scan (and destination for Sort) |
+| `-SelectDrive` | Interactively select one or more drives/volumes to scan (single destination for Sort) |
 | `-DeleteLog` | Path to the deletion/re-acquisition CSV log |
 | `-WhatIf` | Standard PowerShell dry-run for Sort/Delete |
 
@@ -318,14 +320,18 @@ Get-ChildItem "D:\Media" -Directory | .\VideoManager.ps1
 
 ### `-SelectDrive` (interactive drive picker)
 
+At the prompt you can enter a single number, a comma/space-separated list
+(e.g. `1,3,4`), or `all`. Scan selection supports multiple drives; the Sort
+destination is always a single drive.
+
 ```powershell
-# Pick a drive/volume to scan from a numbered list
+# Pick one or more drives/volumes to scan from a numbered list
 .\VideoManager.ps1 -SelectDrive -Recurse
 
-# Pick a source drive AND a destination drive for sorting
+# Pick multiple source drives AND a single destination drive for sorting
 .\VideoManager.ps1 -SelectDrive -Action Sort -Recurse
 
-# Pick a drive, then delete below 480p on it
+# Pick drives, then delete below 480p across all of them
 .\VideoManager.ps1 -SelectDrive -Action Delete -MinResolution 480p -Recurse
 ```
 

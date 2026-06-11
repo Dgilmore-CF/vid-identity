@@ -43,7 +43,9 @@
     Optional path to ffprobe executable.
 
 .PARAMETER SelectDrive
-    Interactively select a drive/volume to scan (and, for Sort, a destination drive).
+    Interactively select one or more drives/volumes to scan (and, for Sort, a single
+    destination drive). Multiple scan drives can be chosen by entering a comma/space
+    separated list of numbers, or 'all'.
 
 .PARAMETER DeleteLog
     Path to the CSV deletion log written before any files are deleted. This log
@@ -447,7 +449,15 @@ function Get-AvailableDrives {
 }
 
 function Select-Drive {
-    param([string]$Prompt = "Select a drive")
+    <#
+        Interactively select one or more drives/volumes.
+        Returns an array of selected roots (use -Multiple to allow more than one).
+        Returns $null if nothing is selected.
+    #>
+    param(
+        [string]$Prompt = "Select a drive",
+        [switch]$Multiple
+    )
     
     $drives = @(Get-AvailableDrives)
     if ($drives.Count -eq 0) {
@@ -462,15 +472,50 @@ function Select-Drive {
         Write-Host ("  [{0}] {1}  ({2})" -f ($i + 1), $d.Root, $freeStr) -ForegroundColor White
     }
     
+    if ($Multiple) {
+        Write-Host "Enter one or more numbers separated by commas or spaces (e.g. 1,3,4)," -ForegroundColor DarkGray
+        Write-Host "type 'all' to select every drive, or leave blank to cancel." -ForegroundColor DarkGray
+    }
+    
     while ($true) {
-        $choice = Read-Host "Enter number (1-$($drives.Count)) or blank to cancel"
+        $promptText = if ($Multiple) { "Selection" } else { "Enter number (1-$($drives.Count)) or blank to cancel" }
+        $choice = Read-Host $promptText
         if ([string]::IsNullOrWhiteSpace($choice)) { return $null }
         
-        $index = 0
-        if ([int]::TryParse($choice, [ref]$index) -and $index -ge 1 -and $index -le $drives.Count) {
-            return $drives[$index - 1].Root
+        if (-not $Multiple) {
+            $index = 0
+            if ([int]::TryParse($choice, [ref]$index) -and $index -ge 1 -and $index -le $drives.Count) {
+                return @($drives[$index - 1].Root)
+            }
+            Write-Host "Invalid selection. Try again." -ForegroundColor Yellow
+            continue
         }
-        Write-Host "Invalid selection. Try again." -ForegroundColor Yellow
+        
+        # Multiple selection: accept "all" or a comma/space-separated list of numbers.
+        if ($choice.Trim() -eq "all") {
+            return @($drives | ForEach-Object { $_.Root })
+        }
+        
+        $tokens = $choice -split '[,\s]+' | Where-Object { $_ }
+        $selected = [System.Collections.Generic.List[string]]::new()
+        $valid = $true
+        
+        foreach ($token in $tokens) {
+            $index = 0
+            if ([int]::TryParse($token, [ref]$index) -and $index -ge 1 -and $index -le $drives.Count) {
+                $root = $drives[$index - 1].Root
+                if (-not $selected.Contains($root)) { $selected.Add($root) }
+            }
+            else {
+                Write-Host "Invalid entry: '$token'. Use numbers 1-$($drives.Count), 'all', or blank to cancel." -ForegroundColor Yellow
+                $valid = $false
+                break
+            }
+        }
+        
+        if ($valid -and $selected.Count -gt 0) {
+            return @($selected)
+        }
     }
 }
 
@@ -841,19 +886,20 @@ Write-Host "Action: $Action" -ForegroundColor White
 
 # Interactive drive selection
 if ($SelectDrive) {
-    $selectedScan = Select-Drive -Prompt "Select a drive/volume to scan"
-    if ($selectedScan) {
-        $Path = @($selectedScan)
-        Write-Host "Scan drive: $selectedScan" -ForegroundColor Green
+    $selectedScan = @(Select-Drive -Prompt "Select one or more drives/volumes to scan" -Multiple)
+    if ($selectedScan.Count -gt 0) {
+        $Path = $selectedScan
+        Write-Host "Scan drive(s): $($selectedScan -join ', ')" -ForegroundColor Green
     } else {
         Write-Host "No drive selected; using default path." -ForegroundColor Yellow
     }
     
+    # Destination must be a single volume for sorting.
     if ($Action -eq "Sort" -and -not $DestinationRoot) {
-        $selectedDest = Select-Drive -Prompt "Select a destination drive/volume for sorted videos"
-        if ($selectedDest) {
-            $DestinationRoot = $selectedDest
-            Write-Host "Destination drive: $selectedDest" -ForegroundColor Green
+        $selectedDest = @(Select-Drive -Prompt "Select a destination drive/volume for sorted videos")
+        if ($selectedDest.Count -gt 0) {
+            $DestinationRoot = $selectedDest[0]
+            Write-Host "Destination drive: $DestinationRoot" -ForegroundColor Green
         }
     }
 }
