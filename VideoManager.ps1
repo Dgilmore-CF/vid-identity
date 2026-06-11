@@ -581,11 +581,51 @@ function Test-SufficientSpace {
 
 #region Export Functions
 
+function Resolve-OutputPath {
+    <#
+        Turn a user-supplied output path into an absolute file path.
+        - Relative paths resolve against the current directory.
+        - A directory (existing, or trailing separator) gets a default filename.
+        Returns the absolute path (file is not created here).
+    #>
+    param(
+        [string]$Path,
+        [string]$DefaultFileName = "VideoInfo.xlsx"
+    )
+    
+    if ([string]::IsNullOrWhiteSpace($Path)) { $Path = $DefaultFileName }
+    
+    # Treat as a folder if it exists as a container or ends with a separator.
+    $endsWithSep = $Path -match '[\\/]\s*$'
+    if ($endsWithSep -or (Test-Path $Path -PathType Container)) {
+        $Path = Join-Path $Path $DefaultFileName
+    }
+    
+    # Make absolute relative to the current working directory.
+    if (-not [System.IO.Path]::IsPathRooted($Path)) {
+        $Path = Join-Path (Get-Location).Path $Path
+    }
+    
+    return [System.IO.Path]::GetFullPath($Path)
+}
+
 function Export-ToExcel {
     param(
         [array]$Data,
         [string]$OutputPath
     )
+    
+    $OutputPath = Resolve-OutputPath -Path $OutputPath
+    
+    # Ensure the destination directory exists.
+    $outDir = Split-Path $OutputPath -Parent
+    if ($outDir -and -not (Test-Path $outDir)) {
+        try { New-Item -Path $outDir -ItemType Directory -Force | Out-Null }
+        catch {
+            Write-Warning "Could not create output directory '$outDir': $_"
+            return
+        }
+    }
     
     # Ensure the module is actually loaded (availability alone is not enough).
     if (-not (Get-Command Export-Excel -ErrorAction SilentlyContinue)) {
@@ -595,14 +635,25 @@ function Export-ToExcel {
     }
     
     if (Get-Command Export-Excel -ErrorAction SilentlyContinue) {
-        $Data | Export-Excel -Path $OutputPath -AutoSize -AutoFilter -FreezeTopRow -BoldTopRow -WorksheetName "Video Info"
-        Write-Host "Excel file created: $OutputPath" -ForegroundColor Green
+        try {
+            $Data | Export-Excel -Path $OutputPath -AutoSize -AutoFilter -FreezeTopRow -BoldTopRow -WorksheetName "Video Info"
+            Write-Host "Excel file saved to: $OutputPath" -ForegroundColor Green
+        }
+        catch {
+            Write-Warning "Failed to write Excel file '$OutputPath': $_"
+        }
     }
     else {
         $csvPath = [System.IO.Path]::ChangeExtension($OutputPath, ".csv")
-        $Data | Export-Csv -Path $csvPath -NoTypeInformation -Encoding UTF8
-        Write-Host "CSV file created: $csvPath" -ForegroundColor Yellow
-        Write-Host "Tip: Install ImportExcel for .xlsx output: Install-Module ImportExcel -Scope CurrentUser" -ForegroundColor DarkGray
+        try {
+            $Data | Export-Csv -Path $csvPath -NoTypeInformation -Encoding UTF8
+            Write-Host "ImportExcel module not found - saved CSV instead of XLSX." -ForegroundColor Yellow
+            Write-Host "CSV file saved to: $csvPath" -ForegroundColor Yellow
+            Write-Host "Tip: for .xlsx output run: Install-Module ImportExcel -Scope CurrentUser" -ForegroundColor DarkGray
+        }
+        catch {
+            Write-Warning "Failed to write CSV file '$csvPath': $_"
+        }
     }
 }
 
