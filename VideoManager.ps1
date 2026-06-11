@@ -1207,20 +1207,45 @@ if ($resolvedPaths.Count -eq 0) {
 
 # Find video files (extension filtering via HashSet works on PS 5.1 and 7+,
 # recursive or not, unlike Get-ChildItem -Include on a bare directory path).
+# Stream the results so a live progress indicator shows the scan is working
+# (recursive scans of large drives can otherwise look frozen).
 Write-Host "`nScanning $($resolvedPaths.Count) path(s)..." -ForegroundColor White
-$videoFiles = @()
+$videoFiles = [System.Collections.Generic.List[object]]::new()
+$examined = 0
+$matched = 0
+$lastUpdate = [DateTime]::MinValue
+$spinner = '|', '/', '-', '\'
+$spinIndex = 0
+
 foreach ($scanPath in $resolvedPaths) {
-    $found = Get-ChildItem -Path $scanPath -File -Recurse:$Recurse -ErrorAction SilentlyContinue |
-        Where-Object { $VideoExtensionSet.Contains($_.Extension) }
-    if ($found) { $videoFiles += $found }
+    Get-ChildItem -Path $scanPath -File -Recurse:$Recurse -ErrorAction SilentlyContinue | ForEach-Object {
+        $examined++
+        if ($VideoExtensionSet.Contains($_.Extension)) {
+            $videoFiles.Add($_)
+            $matched++
+        }
+        
+        # Throttle UI updates to ~7/sec so the indicator stays smooth without
+        # slowing the scan itself.
+        $now = [DateTime]::Now
+        if (($now - $lastUpdate).TotalMilliseconds -ge 150) {
+            $lastUpdate = $now
+            $spinIndex = ($spinIndex + 1) % $spinner.Count
+            Write-Progress -Activity "Scanning for video files $($spinner[$spinIndex])" `
+                -Status "$matched video(s) found  |  $examined item(s) scanned" `
+                -CurrentOperation $_.DirectoryName
+        }
+    }
 }
 
+Write-Progress -Activity "Scanning for video files" -Completed
+
 if ($videoFiles.Count -eq 0) {
-    Write-Warning "No video files found."
+    Write-Warning "No video files found ($examined item(s) scanned)."
     exit 0
 }
 
-Write-Host "Found $($videoFiles.Count) video file(s)" -ForegroundColor Green
+Write-Host "Found $($videoFiles.Count) video file(s) ($examined item(s) scanned)" -ForegroundColor Green
 
 # Analyze videos
 Write-Host "Analyzing..." -ForegroundColor White
@@ -1234,7 +1259,7 @@ $failedCount = 0
 foreach ($file in $videoFiles) {
     $processed++
     $percent = [math]::Round(($processed / $videoFiles.Count) * 100, 0)
-    Write-Progress -Activity "Analyzing videos" -Status "$processed of $($videoFiles.Count)" -PercentComplete $percent
+    Write-Progress -Activity "Analyzing videos ($percent%)" -Status "$processed of $($videoFiles.Count): $($file.Name)" -PercentComplete $percent
     
     $details = Get-VideoDetails -FilePath $file.FullName -Extended:$useExtended
     if ($details) {
