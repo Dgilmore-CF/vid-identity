@@ -206,6 +206,172 @@ Default location: `VideoManager_DeletedLog_<timestamp>.csv` in the current direc
 
 ---
 
+## Examples Reference
+
+A complete reference of every option. Windows examples use `.\VideoManager.ps1`;
+on macOS/Linux substitute `pwsh ./VideoManager.ps1`.
+
+### `-Path` (scan location)
+
+```powershell
+# Default: scan the current directory
+.\VideoManager.ps1
+
+# Single directory
+.\VideoManager.ps1 -Path "D:\Videos"
+
+# Multiple directories (comma-separated)
+.\VideoManager.ps1 -Path "D:\Videos", "E:\Movies", "F:\TV"
+
+# Positional (the -Path name is optional)
+.\VideoManager.ps1 "D:\Videos"
+
+# Piped in from another command
+Get-ChildItem "D:\Media" -Directory | .\VideoManager.ps1
+```
+
+### `-Recurse` (include subfolders)
+
+```powershell
+# Scan the top level only (default)
+.\VideoManager.ps1 -Path "D:\Videos"
+
+# Scan all subfolders too
+.\VideoManager.ps1 -Path "D:\Videos" -Recurse
+```
+
+### `-Action Analyze` (default) — export metadata
+
+```powershell
+# Explicitly request Analyze
+.\VideoManager.ps1 -Path "D:\Videos" -Action Analyze -Recurse
+
+# Analyze is the default, so this is equivalent
+.\VideoManager.ps1 -Path "D:\Videos" -Recurse
+```
+
+### `-OutputFile` (Analyze output path)
+
+```powershell
+# Default: <first scan path>\VideoInfo.xlsx
+.\VideoManager.ps1 -Path "D:\Videos" -Recurse
+
+# Custom Excel output (requires ImportExcel module)
+.\VideoManager.ps1 -Path "D:\Videos" -Recurse -OutputFile "D:\Reports\Library.xlsx"
+
+# Without ImportExcel, output automatically falls back to .csv
+.\VideoManager.ps1 -Path "D:\Videos" -Recurse -OutputFile "D:\Reports\Library.csv"
+```
+
+### `-Action Sort` + `-DestinationRoot` — organize by resolution
+
+```powershell
+# Move videos into resolution subfolders under the destination root
+.\VideoManager.ps1 -Path "D:\Videos" -Action Sort -DestinationRoot "D:\Sorted" -Recurse
+
+# The destination root is created automatically if it does not exist
+.\VideoManager.ps1 -Path "D:\Videos" -Action Sort -DestinationRoot "D:\New\Sorted"
+
+# Preview a sort without moving anything (standard dry-run)
+.\VideoManager.ps1 -Path "D:\Videos" -Action Sort -DestinationRoot "D:\Sorted" -WhatIf
+```
+
+### `-Action Delete` + `-MinResolution` — remove low-res videos
+
+```powershell
+# Delete everything below 720p (prompts: type DELETE to confirm)
+.\VideoManager.ps1 -Path "D:\Videos" -Action Delete -MinResolution 720p -Recurse
+
+# Valid thresholds: 4K, 1440p, 1080p, 720p, 480p, 360p
+.\VideoManager.ps1 -Path "D:\Videos" -Action Delete -MinResolution 1080p -Recurse
+```
+
+### `-Force` (skip the confirmation prompt)
+
+```powershell
+# Delete below 1080p with no confirmation prompt
+.\VideoManager.ps1 -Path "D:\Videos" -Action Delete -MinResolution 1080p -Recurse -Force
+```
+
+### `-Action Report` — dry-run preview (no changes)
+
+```powershell
+# Preview what a Delete would remove (also writes a re-acquisition log)
+.\VideoManager.ps1 -Path "D:\Videos" -Action Report -MinResolution 1080p -Recurse
+
+# Preview how a Sort would distribute files
+.\VideoManager.ps1 -Path "D:\Videos" -Action Report -DestinationRoot "D:\Sorted" -Recurse
+
+# Preview both at once
+.\VideoManager.ps1 -Path "D:\Videos" -Action Report -MinResolution 720p -DestinationRoot "D:\Sorted" -Recurse
+```
+
+### `-WhatIf` (standard PowerShell dry-run)
+
+```powershell
+# Equivalent to a Sort dry-run, using the built-in -WhatIf switch
+.\VideoManager.ps1 -Path "D:\Videos" -Action Sort -DestinationRoot "D:\Sorted" -WhatIf
+
+# Delete dry-run via -WhatIf (still writes the re-acquisition log, deletes nothing)
+.\VideoManager.ps1 -Path "D:\Videos" -Action Delete -MinResolution 720p -WhatIf
+```
+
+### `-SelectDrive` (interactive drive picker)
+
+```powershell
+# Pick a drive/volume to scan from a numbered list
+.\VideoManager.ps1 -SelectDrive -Recurse
+
+# Pick a source drive AND a destination drive for sorting
+.\VideoManager.ps1 -SelectDrive -Action Sort -Recurse
+
+# Pick a drive, then delete below 480p on it
+.\VideoManager.ps1 -SelectDrive -Action Delete -MinResolution 480p -Recurse
+```
+
+### `-DeleteLog` (re-acquisition log path)
+
+```powershell
+# Default: VideoManager_DeletedLog_<timestamp>.csv in the current directory
+.\VideoManager.ps1 -Path "D:\Videos" -Action Delete -MinResolution 720p
+
+# Custom log path
+.\VideoManager.ps1 -Path "D:\Videos" -Action Delete -MinResolution 720p -DeleteLog "D:\reacquire.csv"
+
+# The log is also produced in Report mode for the would-be-deleted set
+.\VideoManager.ps1 -Path "D:\Videos" -Action Report -MinResolution 1080p -DeleteLog "D:\preview.csv"
+```
+
+### `-FFprobePath` (explicit ffprobe location)
+
+```powershell
+# Point at a specific ffprobe binary if it is not on PATH
+.\VideoManager.ps1 -Path "D:\Videos" -FFprobePath "C:\ffmpeg\bin\ffprobe.exe"
+
+# macOS/Linux
+pwsh ./VideoManager.ps1 -Path "/home/user/Videos" -FFprobePath "/usr/local/bin/ffprobe"
+```
+
+### Combined / real-world examples
+
+```powershell
+# Full analysis of multiple drives into one custom Excel report
+.\VideoManager.ps1 -Path "D:\Videos", "E:\Movies" -Recurse -OutputFile "D:\Reports\AllMedia.xlsx"
+
+# Safely preview, then perform a cleanup of sub-720p files with a named log
+.\VideoManager.ps1 -Path "D:\Videos" -Action Report -MinResolution 720p -Recurse -DeleteLog "D:\cleanup.csv"
+.\VideoManager.ps1 -Path "D:\Videos" -Action Delete -MinResolution 720p -Recurse -Force -DeleteLog "D:\cleanup.csv"
+
+# Interactive: choose a drive, sort it, and dry-run first
+.\VideoManager.ps1 -SelectDrive -Action Sort -Recurse -WhatIf
+
+# Get the built-in help (auto-generated from comment-based help)
+Get-Help .\VideoManager.ps1 -Full
+Get-Help .\VideoManager.ps1 -Examples
+```
+
+---
+
 ## Disk Space Handling
 
 - **Same-drive moves**: Instant, no space check needed
